@@ -18,8 +18,10 @@ package main
 
 import (
 	"fmt"
+	"context"
 	"github.com/opencord/voltha-api-server/internal/pkg/afrouter"
 	"github.com/opencord/voltha-go/common/log"
+	"github.com/opencord/voltha-go/common/probe"
 	"github.com/opencord/voltha-go/common/version"
 	_ "github.com/opencord/voltha-protos"
 	"google.golang.org/grpc/grpclog"
@@ -68,6 +70,28 @@ func main() {
 		grpclog.SetLoggerV2(grpclog.NewLoggerV2(os.Stderr, ioutil.Discard, ioutil.Discard))
 	}
 
+	/*
+	 * Create and start the liveness and readiness container management probes. This
+	 * is done in the main function so just in case the main starts multiple other
+	 * objects there can be a single probe end point for the process.
+	 */
+	p := &probe.Probe{}
+	go p.ListenAndServe(*conf.ProbePort)
+	//go p.ListenAndServe(fmt.Sprintf("%s:%d", conf.ProbeHost, conf.ProbePort))
+
+	// Add the probe to the context to pass to all the services started
+	probeCtx := context.WithValue(ctx, probe.ProbeContextKey, p)
+
+	// If the context has a probe then fetch it and register our services
+	if value := ctx.Value(probe.ProbeContextKey); value != nil {
+		if _, ok := value.(*probe.Probe); ok {
+			p = value.(*probe.Probe)
+			p.RegisterService(
+				"affinity-router-proxy",
+			)
+		}
+	}
+
 	// Install the signal and error handlers.
 	err = afrouter.InitExitHandler()
 	if err != nil {
@@ -76,7 +100,7 @@ func main() {
 	}
 
 	// Create the affinity router proxy...
-	if ap, err := afrouter.NewArouterProxy(conf); err != nil {
+	if ap, err := afrouter.NewArouterProxy(conf, probeCtx); err != nil {
 		log.Errorf("Failed to create the arouter proxy, exiting:%v", err)
 		return
 		// and start it.

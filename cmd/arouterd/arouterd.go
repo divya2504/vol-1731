@@ -29,10 +29,12 @@ import (
 	"regexp"
 	"strconv"
 	"time"
+	"context"
 
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/empty"
 	"github.com/opencord/voltha-go/common/log"
+	"github.com/opencord/voltha-go/common/probe"
 	"github.com/opencord/voltha-go/common/version"
 	"github.com/opencord/voltha-go/kafka"
 	pb "github.com/opencord/voltha-protos/go/afrouter"
@@ -57,6 +59,8 @@ type volthaPod struct {
 
 type Configuration struct {
 	DisplayVersionOnly *bool
+	ProbeHost          *string
+	ProbePort          *int
 }
 
 var (
@@ -297,7 +301,9 @@ func startDiscoveryMonitor(ctx context.Context, client pb.ConfigurationClient) (
 	for {
 		if err := kc.Start(); err != nil {
 			log.Error("Could not connect to kafka")
+			probe.UpdateStatusFromContext(ctx, "message-bus", probe.ServiceStatusStopped)
 		} else {
+			probe.UpdateStatusFromContext(ctx, "message-bus", probe.ServiceStatusRunning)
 			break
 		}
 		select {
@@ -313,6 +319,7 @@ func startDiscoveryMonitor(ctx context.Context, client pb.ConfigurationClient) (
 		log.Errorf("Could not subscribe to the '%s' channel, discovery disabled", kafkaTopic)
 		close(doneCh)
 		kc.Stop()
+		probe.UpdateStatusFromContext(ctx, "message-bus", probe.ServiceStatusStopped)
 		return doneCh, err
 	}
 
@@ -381,8 +388,7 @@ loop:
 }
 
 // endOnClose cancels the context when the connection closes
-func connectionActiveContext(conn *grpc.ClientConn) context.Context {
-	ctx, disconnected := context.WithCancel(context.Background())
+func connectionActiveContext(conn *grpc.ClientConn, ctx context.Context, disconnected context.CancelFunc) {
 	go func() {
 		for state := conn.GetState(); state != connectivity.TransientFailure && state != connectivity.Shutdown; state = conn.GetState() {
 			if !conn.WaitForStateChange(context.Background(), state) {
@@ -391,16 +397,18 @@ func connectionActiveContext(conn *grpc.ClientConn) context.Context {
 		}
 		log.Infof("Connection to afrouter lost")
 		disconnected()
+		probe.UpdateStatusFromContext(ctx, "affinity-router", probe.ServiceStatusStopped)
 	}()
-	return ctx
 }
 
 func main() {
 	config := &Configuration{}
 	cmdParse := flag.NewFlagSet(path.Base(os.Args[0]), flag.ContinueOnError)
 	config.DisplayVersionOnly = cmdParse.Bool("version", false, "Print version information and exit")
+	config.ProbeHost = cmdParse.String("probeHost", "", "probe host info")
+	config.ProbePort = cmdParse.Int("probePort", 0, "probe port info")
 
-	if err := cmdParse.Parse(os.Args[1:]); err != nil {
+	if err := cmdParse.Parse(os.Args[3:]); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
@@ -419,15 +427,43 @@ func main() {
 	// Set up kubernetes api
 	clientset := k8sClientSet()
 
+	/*
+	 * Create and start the liveness and readiness container management probes. This
+	 * is done in the main function so just in case the main starts multiple other
+	 * objects there can be a single probe end point for the process.
+	 */
+	ctx, cancel := context.WithCancel(context.Background())
+
+	p := &probe.Probe{}
+	go p.ListenAndServe(*config.ProbePort)
+	//go p.ListenAndServe(*config.ProbeHost, *config.ProbePort)
+
+	// Add the probe to the context to pass to all the services started
+	probeCtx := context.WithValue(ctx, probe.ProbeContextKey, p)
+
+	// If the context has a probe then fetch it and register our services
+	if value := ctx.Value(probe.ProbeContextKey); value != nil {
+		if _, ok := value.(*probe.Probe); ok {
+			p = value.(*probe.Probe)
+			p.RegisterService(
+				"affinity-router",
+				"message-bus",
+			)
+		}
+	}
+
 	for {
 		// Connect to the affinity router
-		conn, err := connect(context.Background(), afrouterApiAddress) // This is a sidecar container so communicating over localhost
+		conn, err := connect(probeCtx, afrouterApiAddress) // This is a sidecar container so communicating over localhost
 		if err != nil {
 			panic(err)
 		}
+		if p != nil {
+			p.UpdateStatus("affinity-router", probe.ServiceStatusRunning)
+		}
 
 		// monitor the connection status, end context if connection is lost
-		ctx := connectionActiveContext(conn)
+		connectionActiveContext(conn, probeCtx, cancel)
 
 		// set up the client
 		client := pb.NewConfigurationClient(conn)
@@ -436,10 +472,10 @@ func main() {
 		// these two processes do the majority of the work
 
 		log.Info("Starting discovery monitoring")
-		doneCh, _ := startDiscoveryMonitor(ctx, client)
+		doneCh, _ := startDiscoveryMonitor(probeCtx, client)
 
 		log.Info("Starting core monitoring")
-		coreMonitor(ctx, client, clientset)
+		coreMonitor(probeCtx, client, clientset)
 
 		//ensure the discovery monitor to quit
 		<-doneCh

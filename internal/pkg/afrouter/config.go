@@ -72,6 +72,8 @@ type Configuration struct {
 	BackendClusters    []BackendClusterConfig `json:"backend_clusters"`
 	Routers            []RouterConfig         `json:"routers"`
 	Api                ApiConfig
+	ProbeHost          *string `json:"probeHost"`
+	ProbePort          *int    `json:"probePort"`
 }
 
 type RouterConfig struct {
